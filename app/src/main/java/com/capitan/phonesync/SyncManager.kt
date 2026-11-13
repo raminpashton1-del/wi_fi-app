@@ -1,292 +1,123 @@
 
 package com.capitan.phonesync
 
-import android.content.Context
-import android.net.Uri
-import android.provider.MediaStore
-import android.provider.ContactsContract
-import android.provider.OpenableColumns
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Intent
+import android.os.Build
+import android.os.IBinder
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
-import java.io.DataOutputStream
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
-object SyncManager {
+class SyncService : Service() {
 
-    private const val API = "https://api.telegram.org"
-    private const val MAX_SIZE = 49L * 1024L * 1024L
-
-    data class SyncResult(
-        val sent: Int,
-        val failed: Int,
-        val skipped: Int
+    private val scope = CoroutineScope(
+        SupervisorJob() + Dispatchers.IO
     )
 
-    suspend fun syncAll(
-        context: Context,
-        botToken: String,
-        chatId: String,
-        onProgress: (String) -> Unit = {}
-    ): SyncResult = withContext(Dispatchers.IO) {
+    private val channelId = "capitan_sync_channel"
 
-        var sent = 0
-        var failed = 0
-        var skipped = 0
-
-        if (botToken.isBlank() || chatId.isBlank()) {
-            return@withContext SyncResult(0, 0, 0)
-        }
-
-        val files = mutableListOf<Uri>()
-
-        try {
-            val collection = MediaStore.Files.getContentUri("external")
-
-            val projection = arrayOf(
-                MediaStore.Files.FileColumns._ID,
-                MediaStore.Files.FileColumns.SIZE
-            )
-
-            context.contentResolver.query(
-                collection,
-                projection,
-                null,
-                null,
-                MediaStore.Files.FileColumns.DATE_ADDED + " ASC"
-            )?.use { cursor ->
-
-                val idColumn = cursor.getColumnIndexOrThrow(
-                    MediaStore.Files.FileColumns._ID
-                )
-
-                val sizeColumn = cursor.getColumnIndexOrThrow(
-                    MediaStore.Files.FileColumns.SIZE
-                )
-
-                while (cursor.moveToNext()) {
-                    val id = cursor.getLong(idColumn)
-                    val size = cursor.getLong(sizeColumn)
-
-                    if (size > MAX_SIZE) {
-                        skipped++
-                        continue
-                    }
-
-                    files.add(
-                        Uri.withAppendedPath(collection, id.toString())
-                    )
-                }
-            }
-
-        } catch (e: Exception) {
-            onProgress("خطا در خواندن فایل‌ها: ${e.message}")
-        }
-
-        for ((index, uri) in files.withIndex()) {
-            onProgress("ارسال فایل ${index + 1} از ${files.size}")
-
-            if (sendFile(context, botToken, chatId, uri)) {
-                sent++
-            } else {
-                failed++
-            }
-        }
-
-        onProgress("در حال انتقال مخاطبین...")
-        val contactsSent = sendContacts(context, botToken, chatId)
-
-        if (contactsSent) sent++ else failed++
-
-        SyncResult(sent, failed, skipped)
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
     }
 
-    suspend fun sendFile(
-        context: Context,
-        botToken: String,
-        chatId: String,
-        uri: Uri
-    ): Boolean = withContext(Dispatchers.IO) {
+    override fun onStartCommand(
+        intent: Intent?,
+        flags: Int,
+        startId: Int
+    ): Int {
 
-        try {
-            val resolver = context.contentResolver
+        startForeground(
+            1001,
+            createNotification("انتقال اطلاعات در حال آماده‌سازی است")
+        )
 
-            var fileName = "file"
-
-            resolver.query(
-                uri,
-                arrayOf(OpenableColumns.DISPLAY_NAME),
-                null,
-                null,
-                null
-            )?.use { cursor ->
-                if (cursor.moveToFirst()) {
-                    val index = cursor.getColumnIndex(
-                        OpenableColumns.DISPLAY_NAME
-                    )
-                    if (index >= 0) {
-                        fileName = cursor.getString(index) ?: "file"
-                    }
-                }
-            }
-
-            val mime = resolver.getType(uri)
-                ?: "application/octet-stream"
-
-            val boundary = "CapitanSyncBoundary"
-
-            val connection = URL(
-                "$API/bot$botToken/sendDocument"
-            ).openConnection() as HttpURLConnection
-
-            connection.requestMethod = "POST"
-            connection.doOutput = true
-            connection.connectTimeout = 30000
-            connection.readTimeout = 120000
-            connection.setChunkedStreamingMode(65536)
-
-            connection.setRequestProperty(
-                "Content-Type",
-                "multipart/form-data; boundary=$boundary"
+        scope.launch {
+            val prefs = getSharedPreferences(
+                "capitan_sync",
+                MODE_PRIVATE
             )
 
-            DataOutputStream(connection.outputStream).use { output ->
+            val token = prefs.getString("token", "") ?: ""
+            val chatId = prefs.getString("chat", "") ?: ""
 
-                fun field(name: String, value: String) {
-                    output.writeBytes("--$boundary\r\n")
-                    output.writeBytes(
-                        "Content-Disposition: form-data; name=\"$name\"\r\n\r\n"
-                    )
-                    output.write(value.toByteArray(Charsets.UTF_8))
-                    output.writeBytes("\r\n")
+            if (token.isBlank() || chatId.isBlank()) {
+                updateNotification("توکن یا شناسه تلگرام تنظیم نشده است")
+                stopSelf()
+                return@launch
+            }
+
+            try {
+                val result = SyncManager.syncAll(
+                    this@SyncService,
+                    token,
+                    chatId
+                ) { message ->
+                    updateNotification(message)
                 }
 
-                field("chat_id", chatId)
-
-                val safeName = fileName
-                    .replace("\"", "_")
-                    .replace("\r", "_")
-                    .replace("\n", "_")
-
-                output.writeBytes("--$boundary\r\n")
-                output.writeBytes(
-                    "Content-Disposition: form-data; name=\"document\"; filename=\"$safeName\"\r\n"
+                updateNotification(
+                    "پایان انتقال | موفق: ${result.sent} | ناموفق: ${result.failed} | ردشده: ${result.skipped}"
                 )
-                output.writeBytes("Content-Type: $mime\r\n\r\n")
 
-                resolver.openInputStream(uri)?.use {
-                    it.copyTo(output)
-                } ?: throw Exception("Cannot open file")
-
-                output.writeBytes("\r\n--$boundary--\r\n")
-                output.flush()
+            } catch (e: Exception) {
+                updateNotification("خطا در انتقال اطلاعات")
             }
 
-            val response = if (connection.responseCode in 200..299) {
-                connection.inputStream.bufferedReader().use {
-                    it.readText()
-                }
-            } else {
-                connection.errorStream?.bufferedReader()?.use {
-                    it.readText()
-                } ?: ""
-            }
+            stopSelf()
+        }
 
-            connection.disconnect()
-            JSONObject(response).optBoolean("ok", false)
+        return START_NOT_STICKY
+    }
 
-        } catch (e: Exception) {
-            false
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                channelId,
+                "CAPITAN PHONE SYNC",
+                NotificationManager.IMPORTANCE_LOW
+            )
+
+            getSystemService(NotificationManager::class.java)
+                .createNotificationChannel(channel)
         }
     }
 
-    private suspend fun sendContacts(
-        context: Context,
-        botToken: String,
-        chatId: String
-    ): Boolean = withContext(Dispatchers.IO) {
-
-        try {
-            val contacts = StringBuilder("CAPITAN PHONE SYNC\nCONTACTS\n\n")
-
-            context.contentResolver.query(
-                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
-                arrayOf(
-                    ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
-                    ContactsContract.CommonDataKinds.Phone.NUMBER
-                ),
-                null,
-                null,
-                null
-            )?.use { cursor ->
-
-                val nameIndex = cursor.getColumnIndexOrThrow(
-                    ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME
-                )
-
-                val numberIndex = cursor.getColumnIndexOrThrow(
-                    ContactsContract.CommonDataKinds.Phone.NUMBER
-                )
-
-                while (cursor.moveToNext()) {
-                    val name = cursor.getString(nameIndex) ?: ""
-                    val number = cursor.getString(numberIndex) ?: ""
-
-                    contacts.append(name)
-                        .append(" : ")
-                        .append(number)
-                        .append("\n")
-                }
-            }
-
-            val text = contacts.toString()
-            val chunks = text.chunked(3000)
-
-            for (chunk in chunks) {
-                val connection = URL(
-                    "$API/bot$botToken/sendMessage"
-                ).openConnection() as HttpURLConnection
-
-                connection.requestMethod = "POST"
-                connection.doOutput = true
-                connection.connectTimeout = 20000
-                connection.readTimeout = 30000
-                connection.setRequestProperty(
-                    "Content-Type",
-                    "application/json; charset=UTF-8"
-                )
-
-                val body = JSONObject().apply {
-                    put("chat_id", chatId)
-                    put("text", chunk)
-                }
-
-                connection.outputStream.use {
-                    it.write(body.toString().toByteArray(Charsets.UTF_8))
-                }
-
-                val response = if (connection.responseCode in 200..299) {
-                    connection.inputStream.bufferedReader().use {
-                        it.readText()
-                    }
-                } else {
-                    connection.errorStream?.bufferedReader()?.use {
-                        it.readText()
-                    } ?: ""
-                }
-
-                connection.disconnect()
-
-                if (!JSONObject(response).optBoolean("ok", false)) {
-                    return@withContext false
-                }
-            }
-
-            true
-
-        } catch (e: Exception) {
-            false
+    private fun createNotification(message: String): Notification {
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, channelId)
+        } else {
+            Notification.Builder(this)
         }
+
+        return builder
+            .setContentTitle("CAPITAN PHONE SYNC")
+            .setContentText(message)
+            .setSmallIcon(android.R.drawable.stat_sys_upload)
+            .setOngoing(true)
+            .build()
+    }
+
+    private fun updateNotification(message: String) {
+        val manager = getSystemService(
+            NotificationManager::class.java
+        )
+
+        manager.notify(1001, createNotification(message))
+    }
+
+    override fun onBind(intent: Intent?): IBinder? {
+        return null
+    }
+
+    override fun onDestroy() {
+        scope.cancel()
+        super.onDestroy()
     }
 }
